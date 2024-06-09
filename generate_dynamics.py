@@ -169,6 +169,10 @@ def process_video(agent, video_path, output_json_path, output_video_path):
 
 
 def main(model, weights, directory_path, output_directory, mode, test_video_path=None):
+
+    if not os.path.exists(output_directory):
+        os.makedirs(output_directory)
+        
     agent_parameters = pickle.load(open(model, "rb"))
     net_kwargs = agent_parameters["model"]["args"]["net"]["args"]
     pi_head_kwargs = agent_parameters["model"]["args"]["pi_head_opts"]

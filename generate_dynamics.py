@@ -72,7 +72,6 @@ Press any button the window to proceed to the next frame.
 # This is for mapping from recorded sensitivity to the one used in the model
 CAMERA_SCALER = 360.0 / 2400.0
 
-
 def json_action_to_env_action(json_action):
     """
     Converts a json action into a MineRL action.
@@ -120,7 +119,23 @@ def json_action_to_env_action(json_action):
 
     return env_action, is_null_action
 
-def process_video(agent, video_path, output_json_path, output_video_path):
+def human_detected(frame, net):
+    """
+    Check if there is a human in the frame using a pre-trained MobileNet SSD.
+    """
+    (h, w) = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
+    net.setInput(blob)
+    detections = net.forward()
+    
+    for i in range(detections.shape[2]):
+        confidence = detections[0, 0, i, 2]
+        idx = int(detections[0, 0, i, 1])
+        if confidence > 0.6 and idx == 15:  # 15 is the class ID for humans in MobileNet SSD
+            return True
+    return False
+
+def process_video(agent, video_path, output_json_path, output_video_path, net):
     cap = cv2.VideoCapture(video_path)
     required_resolution = ENV_KWARGS["resolution"]
     json_data = []
@@ -129,24 +144,28 @@ def process_video(agent, video_path, output_json_path, output_video_path):
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, 30.0, (640, 360))
 
-    batch_size = 128 
-    frame_count = 0  
+    human_present = False
+    batch_size = 128
+    frame_count = 0
     while True:
         frames = []
-        print("Loading frames...")  
-        for _ in range(batch_size):  
+        print("Loading frames...")
+        for _ in range(batch_size):
             ret, frame = cap.read()
             if not ret:
                 break
+            if human_detected(frame, net):
+                human_present = True
+                break
             frame_downsampled = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
-            out.write(frame_downsampled)  
-            frames.append(frame[..., ::-1])  
+            out.write(frame_downsampled)
+            frames.append(frame[..., ::-1])
             total_frames += 1
 
-        if not frames:
-            break  
+        if human_present or not frames:
+            break
 
-        print(f"Processing batch: {frame_count + 1}") 
+        print(f"Processing batch: {frame_count + 1}")
         frames = np.stack(frames)
         predicted_actions = agent.predict_actions(frames)
         for i in range(len(frames)):
@@ -154,22 +173,21 @@ def process_video(agent, video_path, output_json_path, output_video_path):
             json_data.append(action_record)
 
         frame_count += len(frames)
-        print(f"Processed {frame_count} frames so far...")  
+        print(f"Processed {frame_count} frames so far...")
         th.cuda.empty_cache()
 
     cap.release()
     out.release()
 
-    if len(json_data) == total_frames:
+    if human_present:
+        print("Human detected. Video rejected.")
+    else:
         with open(output_json_path, "w") as f:
             json.dump(json_data, f, indent=4)
         print("All frames processed successfully and data saved.")
-    else:
-        print(f"Warning: Frame-action mismatch in {video_path} ({len(json_data)} actions for {total_frames} frames).")
 
 
 def main(model, weights, directory_path, output_directory, mode, test_video_path=None):
-
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
         
@@ -180,11 +198,15 @@ def main(model, weights, directory_path, output_directory, mode, test_video_path
     agent = IDMAgent(idm_net_kwargs=net_kwargs, pi_head_kwargs=pi_head_kwargs)
     agent.load_weights(weights)
 
+    # Load the pre-trained MobileNet SSD model for human detection
+    net = cv2.dnn.readNetFromCaffe('path_to_prototxt_file/MobileNetSSD_deploy.prototxt',
+                                   'path_to_caffemodel_file/MobileNetSSD_deploy.caffemodel')
+
     if mode == 'test' and test_video_path:
         video_file = os.path.basename(test_video_path)
         output_json_path = os.path.join(output_directory, f"{video_file[:-4]}_actions.json")
         output_video_path = os.path.join(output_directory, f"{video_file[:-4]}_downsampled.mp4")
-        process_video(agent, test_video_path, output_json_path, output_video_path)
+        process_video(agent, test_video_path, output_json_path, output_video_path, net)
     elif mode == 'launch':
         for folder_name in os.listdir(directory_path):
             folder_path = os.path.join(directory_path, folder_name)
@@ -194,7 +216,7 @@ def main(model, weights, directory_path, output_directory, mode, test_video_path
                         video_path = os.path.join(folder_path, file_name)
                         output_json_path = os.path.join(output_directory, f"{file_name[:-4]}_actions.json")
                         output_video_path = os.path.join(output_directory, f"{file_name[:-4]}_downsampled.mp4")
-                        process_video(agent, video_path, output_json_path, output_video_path)
+                        process_video(agent, video_path, output_json_path, output_video_path, net)
     else:
         print("Invalid mode or test video path not provided for test mode.")
 

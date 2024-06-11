@@ -5,10 +5,12 @@ import numpy as np
 import json
 import torch as th
 import os
+import logging
 
 from agent import ENV_KWARGS
 from inverse_dynamics_model import IDMAgent
 
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 KEYBOARD_BUTTON_MAPPING = {
     "key.keyboard.escape" :"ESC",
@@ -61,136 +63,95 @@ NOOP_ACTION = {
     "pickItem": 0,
 }
 
-MESSAGE = """
-This script will take a video, predict actions for its frames and
-and show them with a cv2 window.
-
-Press any button the window to proceed to the next frame.
-"""
-
-# Matches a number in the MineRL Java code regarding sensitivity
-# This is for mapping from recorded sensitivity to the one used in the model
-CAMERA_SCALER = 360.0 / 2400.0
-
 def json_action_to_env_action(json_action):
     """
     Converts a json action into a MineRL action.
-    Returns (minerl_action, is_null_action)
+    Returns a tuple of (minerl_action, is_null_action)
     """
-    # This might be slow...
     env_action = NOOP_ACTION.copy()
-    # As a safeguard, make camera action again so we do not override anything
-    env_action["camera"] = np.array([0, 0])
+    env_action["camera"] = np.array([0, 0])  # Reset camera to avoid overriding
 
     is_null_action = True
-    keyboard_keys = json_action["keyboard"]["keys"]
+    keyboard_keys = json_action.get("keyboard", {}).get("keys", [])
     for key in keyboard_keys:
-        # You can have keys that we do not use, so just skip them
-        # NOTE in original training code, ESC was removed and replaced with
-        #      "inventory" action if GUI was open.
-        #      Not doing it here, as BASALT uses ESC to quit the game.
         if key in KEYBOARD_BUTTON_MAPPING:
             env_action[KEYBOARD_BUTTON_MAPPING[key]] = 1
             is_null_action = False
 
-    mouse = json_action["mouse"]
+    mouse = json_action.get("mouse", {})
     camera_action = env_action["camera"]
-    camera_action[0] = mouse["dy"] * CAMERA_SCALER
-    camera_action[1] = mouse["dx"] * CAMERA_SCALER
-
-    if mouse["dx"] != 0 or mouse["dy"] != 0:
+    camera_action[0] = mouse.get("dy", 0) * CAMERA_SCALER
+    camera_action[1] = mouse.get("dx", 0) * CAMERA_SCALER
+    if mouse.get("dx", 0) != 0 or mouse.get("dy", 0) != 0:
         is_null_action = False
     else:
-        if abs(camera_action[0]) > 180:
+        if abs(camera_action[0]) > 180 or abs(camera_action[1]) > 180:
+            logging.warning("Camera action out of bounds, resetting to zero.")
             camera_action[0] = 0
-        if abs(camera_action[1]) > 180:
             camera_action[1] = 0
 
-    mouse_buttons = mouse["buttons"]
-    if 0 in mouse_buttons:
-        env_action["attack"] = 1
-        is_null_action = False
-    if 1 in mouse_buttons:
-        env_action["use"] = 1
-        is_null_action = False
-    if 2 in mouse_buttons:
-        env_action["pickItem"] = 1
-        is_null_action = False
+    mouse_buttons = mouse.get("buttons", [])
+    for button, action in enumerate(["attack", "use", "pickItem"]):
+        if button in mouse_buttons:
+            env_action[action] = 1
+            is_null_action = False
 
     return env_action, is_null_action
 
-def human_detected(frame, net):
+def process_video(agent, video_path, output_json_path, output_video_path):
     """
-    Check if there is a human in the frame using a pre-trained MobileNet SSD.
+    Process the video to predict actions and save results in JSON and downscaled video.
     """
-    (h, w) = frame.shape[:2]
-    blob = cv2.dnn.blobFromImage(cv2.resize(frame, (300, 300)), 0.007843, (300, 300), 127.5)
-    net.setInput(blob)
-    detections = net.forward()
-    
-    for i in range(detections.shape[2]):
-        confidence = detections[0, 0, i, 2]
-        idx = int(detections[0, 0, i, 1])
-        if confidence > 0.6 and idx == 15:  # 15 is the class ID for humans in MobileNet SSD
-            return True
-    return False
-
-def process_video(agent, video_path, output_json_path, output_video_path, net):
     cap = cv2.VideoCapture(video_path)
-    required_resolution = ENV_KWARGS["resolution"]
-    json_data = []
-    total_frames = 0
+    if not cap.isOpened():
+        logging.error(f"Failed to open video file: {video_path}")
+        return
+
+    # Logging video processing start
+    logging.info(f"Processing video: {video_path}")
 
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
     out = cv2.VideoWriter(output_video_path, fourcc, 30.0, (640, 360))
 
-    human_present = False
     batch_size = 128
     frame_count = 0
+    total_frames = 0
+    json_data = []
+
     while True:
         frames = []
-        print("Loading frames...")
         for _ in range(batch_size):
             ret, frame = cap.read()
             if not ret:
-                break
-            if human_detected(frame, net):
-                human_present = True
                 break
             frame_downsampled = cv2.resize(frame, (640, 360), interpolation=cv2.INTER_AREA)
             out.write(frame_downsampled)
             frames.append(frame[..., ::-1])
             total_frames += 1
 
-        if human_present or not frames:
+        if not frames:
             break
 
-        print(f"Processing batch: {frame_count + 1}")
-        frames = np.stack(frames)
-        predicted_actions = agent.predict_actions(frames)
+        predicted_actions = agent.predict_actions(np.stack(frames))
         for i in range(len(frames)):
             action_record = {action: predicted_actions[action][0, i].tolist() for action in predicted_actions}
             json_data.append(action_record)
 
         frame_count += len(frames)
-        print(f"Processed {frame_count} frames so far...")
-        th.cuda.empty_cache()
+        logging.info(f"Processed {frame_count} frames so far...")
 
     cap.release()
     out.release()
 
-    if human_present:
-        print("Human detected. Video rejected.")
-    else:
-        with open(output_json_path, "w") as f:
-            json.dump(json_data, f, indent=4)
-        print("All frames processed successfully and data saved.")
-
+    with open(output_json_path, "w") as f:
+        json.dump(json_data, f, indent=4)
+    logging.info(f"All frames processed successfully and data saved to {output_json_path}")
 
 def main(model, weights, directory_path, output_directory, mode, test_video_path=None):
+
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
-        
+
     agent_parameters = pickle.load(open(model, "rb"))
     net_kwargs = agent_parameters["model"]["args"]["net"]["args"]
     pi_head_kwargs = agent_parameters["model"]["args"]["pi_head_opts"]
@@ -198,15 +159,11 @@ def main(model, weights, directory_path, output_directory, mode, test_video_path
     agent = IDMAgent(idm_net_kwargs=net_kwargs, pi_head_kwargs=pi_head_kwargs)
     agent.load_weights(weights)
 
-    # Load the pre-trained MobileNet SSD model for human detection
-    net = cv2.dnn.readNetFromCaffe('path_to_prototxt_file/MobileNetSSD_deploy.prototxt',
-                                   'path_to_caffemodel_file/MobileNetSSD_deploy.caffemodel')
-
     if mode == 'test' and test_video_path:
         video_file = os.path.basename(test_video_path)
         output_json_path = os.path.join(output_directory, f"{video_file[:-4]}_actions.json")
         output_video_path = os.path.join(output_directory, f"{video_file[:-4]}_downsampled.mp4")
-        process_video(agent, test_video_path, output_json_path, output_video_path, net)
+        process_video(agent, test_video_path, output_json_path, output_video_path)
     elif mode == 'launch':
         for folder_name in os.listdir(directory_path):
             folder_path = os.path.join(directory_path, folder_name)
@@ -216,7 +173,7 @@ def main(model, weights, directory_path, output_directory, mode, test_video_path
                         video_path = os.path.join(folder_path, file_name)
                         output_json_path = os.path.join(output_directory, f"{file_name[:-4]}_actions.json")
                         output_video_path = os.path.join(output_directory, f"{file_name[:-4]}_downsampled.mp4")
-                        process_video(agent, video_path, output_json_path, output_video_path, net)
+                        process_video(agent, video_path, output_json_path, output_video_path)
     else:
         print("Invalid mode or test video path not provided for test mode.")
 
